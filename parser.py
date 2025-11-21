@@ -4,6 +4,8 @@ import tkinter as tk
 
 # Use pdfplumber for more robust text + layout extraction
 import pdfplumber
+import threading
+from collections import OrderedDict
 from PIL import Image, ImageTk
 
 
@@ -13,35 +15,46 @@ def build_parser():
             "A PDF Parser that displays each word in sequence to improve readability"
         )
     )
-    parser.add_argument("--file", "-f", default="example.pdf", help="PDF file to read")
+    parser.add_argument("--file", "-f", required=True, help="PDF file to read")
     parser.add_argument("--wpm", type=int, default=450, help="Words per minute (positive integer)")
     parser.add_argument("--font-size", type=int, default=60, help="Base font size (pixels)")
     parser.add_argument("--fullscreen", action="store_true", help="Start in fullscreen mode")
     parser.add_argument("--start-paused", action="store_true", help="Start paused")
     parser.add_argument("--resolution", type=int, default=None, help="Render resolution (DPI) for PDF pages; higher gives crisper images")
     parser.add_argument("--no-fit", dest="fit", action="store_false", help="Do not scale pages to fit the window; show at full rendered size with scrollbars")
+    parser.add_argument("--cache-size", type=int, default=16, help="Number of rendered pages to keep in memory (LRU)")
+    parser.add_argument("--start-page", type=int, default=0, help="starting page of pdf to process")
+    parser.add_argument("--end-page", type=int, default=-1, help="ending page of pdf to process")
     
     return parser
 
 
-def load_pdf_with_positions(path, resolution=300):
+def load_pdf_index(path, start_idx, end_idx):
     """
-    Load the PDF using pdfplumber and return:
-      - words: list of dicts {text, page_no, x0,x1,top,bottom}
-      - pages_imgs: list of PIL Images for each page (rendered at given resolution)
-      - pages_meta: list of page objects (pdfplumber Page) for coordinate reference
+    Load minimal PDF index: return words (with page refs) and open PDF object.
+    Caller is responsible for closing the returned pdf when done.
     """
     words = []
-    pages_imgs = []
-    pages_meta = []
-
     try:
         pdf = pdfplumber.open(path)
     except Exception as e:
         raise RuntimeError(f"Failed to open PDF '{path}': {e}")
 
-    for i, page in enumerate(pdf.pages):
-        # extract word boxes (pdfplumber returns word dicts with text,x0,x1,top,bottom)
+    total_pages = len(pdf.pages)
+    
+    # normalize end_idx: -1 or values >= total_pages -> last page
+    if end_idx is None or end_idx < 0 or end_idx >= total_pages:
+        end_idx = total_pages - 1
+    #clamp
+    if start_idx is None or start_idx < 0:
+        start_idx = 0
+    if start_idx >= total_pages:
+        raise RuntimeError(f"start_page {start_idx} is out of range (0..{total_pages-1})")
+    if start_idx > end_idx:
+        raise RuntimeError(f"start_page ({start_idx}) is after end_page ({end_idx})")
+
+    for i in range(start_idx, end_idx + 1):
+        page = pdf.pages[i]
         try:
             page_words = page.extract_words()
         except Exception:
@@ -57,21 +70,7 @@ def load_pdf_with_positions(path, resolution=300):
                 "bottom": float(w.get("bottom", 0.0)),
             })
 
-        # render page to an image for display
-        try:
-            page_image_obj = page.to_image(resolution=resolution)
-            pil_img = page_image_obj.original
-        except Exception:
-            # fallback to a blank image sized to page dimensions
-            w_px = int(page.width * resolution / 72)
-            h_px = int(page.height * resolution / 72)
-            pil_img = Image.new("RGB", (max(1, w_px), max(1, h_px)), "white")
-
-        pages_imgs.append(pil_img)
-        pages_meta.append(page)
-
-    pdf.close()
-    return words, pages_imgs, pages_meta
+    return words, pdf
 
 
 def main():
@@ -104,9 +103,12 @@ def main():
 
     # If user provided an explicit resolution, use it; otherwise compute a DPI so page width maps to screen width
     try:
-        # Peek at the first page's width in PDF points to compute appropriate DPI
+        # Peek at a page's width (prefer start_page if provided) in PDF points to compute appropriate DPI
         pdf_tmp = pdfplumber.open(args.file)
-        first_page = pdf_tmp.pages[0] if pdf_tmp.pages else None
+        preferred_idx = args.start_page if getattr(args, 'start_page', None) is not None else 0
+        if preferred_idx < 0:
+            preferred_idx = 0
+        first_page = pdf_tmp.pages[preferred_idx] if pdf_tmp.pages and preferred_idx < len(pdf_tmp.pages) else (pdf_tmp.pages[0] if pdf_tmp.pages else None)
         page_width_pts = first_page.width if first_page is not None else None
         pdf_tmp.close()
     except Exception:
@@ -121,10 +123,59 @@ def main():
         render_dpi = 300
 
     try:
-        words, pages_imgs, pages_meta = load_pdf_with_positions(args.file, resolution=render_dpi)
+        words, pdf = load_pdf_index(args.file, args.start_page, args.end_page)
     except RuntimeError as e:
         print(e, file=sys.stderr)
         sys.exit(1)
+
+    # validate cache size
+    if args.cache_size is None or args.cache_size < 1:
+        args.cache_size = 8
+
+    # pages cache: render pages on demand into this OrderedDict {page_no: PIL.Image}
+    # we keep it as an LRU (oldest evicted when size > args.cache_size)
+    pages_cache = OrderedDict()
+    pages_lock = threading.Lock()
+
+    def cache_put(pno, pil):
+        """Insert page image into cache and evict oldest entries when over capacity."""
+        with pages_lock:
+            if pno in pages_cache:
+                # move to end to mark as recently used
+                try:
+                    pages_cache.move_to_end(pno)
+                except Exception:
+                    pass
+                return
+            pages_cache[pno] = pil
+            # evict oldest while exceeding capacity
+            try:
+                while len(pages_cache) > args.cache_size:
+                    pages_cache.popitem(last=False)
+            except Exception:
+                pass
+
+    def prefetch_pages(start_page, n=2):
+        """Background prefetch of next n pages starting after start_page."""
+        def _worker():
+            for pno in range(start_page + 1, min(start_page + 1 + n, len(pdf.pages))):
+                with pages_lock:
+                    if pno in pages_cache:
+                        # already cached
+                        continue
+                try:
+                    pil = pdf.pages[pno].to_image(resolution=render_dpi).original
+                    # insert via helper to enforce LRU eviction
+                    try:
+                        cache_put(pno, pil)
+                    except Exception:
+                        with pages_lock:
+                            pages_cache[pno] = pil
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
 
     if not words:
         print("No text found in PDF or the file is empty.")
@@ -188,7 +239,6 @@ def main():
         nonlocal word_index
         if 0 <= word_index < len(words):
             label.config(text=words[word_index]["text"])
-            # ensure highlight follows the current index
             highlight_current_word(word_index)
         else:
             label.config(text="")
@@ -209,10 +259,10 @@ def main():
         right = w["right"]
         bottom = w["bottom"]
 
-        rx0 = int(left * current_display_scale) + current_offset_x
-        rx1 = int(right * current_display_scale) + current_offset_x
-        rtop = int(top * current_display_scale) + current_offset_y
-        rbottom = int(bottom * current_display_scale) + current_offset_y
+        r_left = int(left * current_display_scale) + current_offset_x
+        r_right = int(right * current_display_scale) + current_offset_x
+        r_top = int(top * current_display_scale) + current_offset_y
+        r_bottom = int(bottom * current_display_scale) + current_offset_y
 
         # remove previous rect then draw new one
         if current_rect is not None:
@@ -220,7 +270,7 @@ def main():
                 canvas.delete(current_rect)
             except Exception:
                 pass
-        current_rect = canvas.create_rectangle(rx0, rtop, rx1, rbottom, outline='red', width=3)
+        current_rect = canvas.create_rectangle(r_left, r_top, r_right, r_bottom, outline='red', width=3)
 
         # Scroll canvas to make the rectangle visible (center it when possible)
         try:
@@ -233,8 +283,8 @@ def main():
                 sw = max(1, parts[2])
                 sh = max(1, parts[3])
                 # target center
-                cx = (rx0 + rx1) // 2
-                cy = (rtop + rbottom) // 2
+                cx = (r_left + r_right) // 2
+                cy = (r_top + r_bottom) // 2
                 # compute fractions
                 fx = max(0.0, min(1.0, (cx - c_w / 2) / (sw - c_w))) if sw > c_w else 0.0
                 fy = max(0.0, min(1.0, (cy - c_h / 2) / (sh - c_h))) if sh > c_h else 0.0
@@ -247,14 +297,32 @@ def main():
     def render_page(page_no):
         """Render the given page into the canvas according to fit/full-res settings."""
         nonlocal current_page_no, current_photo, current_display_scale, current_offset_x, current_offset_y, current_rect
-        if page_no is None or page_no < 0 or page_no >= len(pages_imgs):
+        if page_no is None or page_no < 0 or page_no >= len(pdf.pages):
             return
+
+        with pages_lock:
+            pil = pages_cache.get(page_no)
+        if pil is None:
+            try:
+                pil = pdf.pages[page_no].to_image(resolution=render_dpi).original
+            except Exception:
+                # fallback blank image
+                page_obj = pdf.pages[page_no]
+                w_px = int(page_obj.width * render_dpi / 72)
+                h_px = int(page_obj.height * render_dpi / 72)
+                pil = Image.new("RGB", (max(1, w_px), max(1, h_px)), "white")
+            # use cache_put to insert and evict if needed
+            try:
+                cache_put(page_no, pil)
+            except Exception:
+                with pages_lock:
+                    pages_cache[page_no] = pil
+
         current_page_no = page_no
-        pil = pages_imgs[current_page_no]
         canvas.delete("all")
         canvas.update_idletasks()
         img_w, img_h = pil.size
-        page_meta = pages_meta[current_page_no]
+        page_meta = pdf.pages[current_page_no]
 
         if args.fit:
             c_w = max(1, canvas.winfo_width())
@@ -362,6 +430,52 @@ def main():
             return
         word_index = min(word_index + 1, len(words) - 1)
         update_label_for_index()
+        
+                # Page controls in the overlay
+    def goto_next_page(step: int):
+        nonlocal word_index, word_id, paused, current_page_no
+        if current_page_no is None:
+            next_page = 0 if step >= 0 else max(0, len(pdf.pages) - 1)
+        else:
+            next_page = max(0, min(current_page_no + step, len(pdf.pages) - 1))
+        if next_page == current_page_no:
+            return
+        # find first word index on that page
+        found = None
+        for i, w in enumerate(words):
+            if w.get("page") == next_page:
+                found = i
+                break
+        if found is None:
+            return
+
+        # cancel scheduled advancement
+        if word_id is not None:
+            try:
+                root.after_cancel(word_id)
+            except Exception:
+                pass
+
+        word_index = found
+        render_page(next_page)
+        update_label_for_index()
+
+        # prefetch subsequent pages
+        try:
+            prefetch_pages(next_page)
+        except Exception:
+            pass
+
+        # resume auto-advance if not paused
+        if not paused:
+            word_id = root.after(delay_ms, display_next_word)
+
+    btn_frame = tk.Frame(overlay)
+    btn = tk.Button(btn_frame, text="Next Page", command=lambda: goto_next_page(1))
+    btn2 = tk.Button(btn_frame, text="Prev Page", command=lambda: goto_next_page(-1))
+    btn.pack(side=tk.LEFT, padx=6, pady=6)
+    btn2.pack(side=tk.LEFT, padx=6, pady=6)
+    btn_frame.pack(side=tk.BOTTOM, fill=tk.X)
 
 
     # Bind keys globally so focus won't block behavior
@@ -372,7 +486,6 @@ def main():
     root.state('zoomed')
     root.focus_set()
 
-    # Ensure the paned window sash gives the PDF most of the width
     root.update_idletasks()
     try:
         total_w = container.winfo_width()
@@ -384,7 +497,6 @@ def main():
     except Exception:
         pass
 
-    # Render the initial page now that geometry is available and start the loop
     if words:
         render_page(words[word_index]["page"])
 

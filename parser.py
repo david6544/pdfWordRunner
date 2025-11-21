@@ -188,8 +188,60 @@ def main():
         nonlocal word_index
         if 0 <= word_index < len(words):
             label.config(text=words[word_index]["text"])
+            # ensure highlight follows the current index
+            highlight_current_word(word_index)
         else:
             label.config(text="")
+
+
+    def highlight_current_word(idx):
+        """Draw highlight for the word at index `idx` and scroll canvas to make it visible."""
+        nonlocal current_rect
+        if idx is None or idx < 0 or idx >= len(words):
+            return
+        w = words[idx]
+        # ensure page rendered
+        if current_page_no != w["page"]:
+            render_page(w["page"])
+
+        left = w["left"]
+        top = w["top"]
+        right = w["right"]
+        bottom = w["bottom"]
+
+        rx0 = int(left * current_display_scale) + current_offset_x
+        rx1 = int(right * current_display_scale) + current_offset_x
+        rtop = int(top * current_display_scale) + current_offset_y
+        rbottom = int(bottom * current_display_scale) + current_offset_y
+
+        # remove previous rect then draw new one
+        if current_rect is not None:
+            try:
+                canvas.delete(current_rect)
+            except Exception:
+                pass
+        current_rect = canvas.create_rectangle(rx0, rtop, rx1, rbottom, outline='red', width=3)
+
+        # Scroll canvas to make the rectangle visible (center it when possible)
+        try:
+            c_w = max(1, canvas.winfo_width())
+            c_h = max(1, canvas.winfo_height())
+            # scrollregion is (0,0,sw,sh)
+            sr = canvas.cget('scrollregion')
+            if sr:
+                parts = [int(x) for x in sr.split()]
+                sw = max(1, parts[2])
+                sh = max(1, parts[3])
+                # target center
+                cx = (rx0 + rx1) // 2
+                cy = (rtop + rbottom) // 2
+                # compute fractions
+                fx = max(0.0, min(1.0, (cx - c_w / 2) / (sw - c_w))) if sw > c_w else 0.0
+                fy = max(0.0, min(1.0, (cy - c_h / 2) / (sh - c_h))) if sh > c_h else 0.0
+                canvas.xview_moveto(fx)
+                canvas.yview_moveto(fy)
+        except Exception:
+            pass
 
 
     def render_page(page_no):

@@ -532,7 +532,17 @@ def main():
     root.bind_all("<Left>", move_left)
     root.bind_all("<Right>", move_right)
     root.bind_all("<Escape>", lambda e: root.destroy())
-    root.state('zoomed')
+    try:
+        root.state('zoomed')  # Works on Windows
+    except tk.TclError:
+        try:
+            root.attributes('-zoomed', True)  # Alternative for Linux/Unix
+        except Exception:
+            # Fallback to fullscreen if available
+            try:
+                root.attributes('-fullscreen', True)
+            except Exception:
+                pass
     root.focus_set()
 
     root.update_idletasks()
@@ -564,9 +574,8 @@ if __name__ == "__main__":
         print(f"Unexpected error: {e}", file=sys.stderr)
         raise
 
-    
-    
-    
 
-    
-    
+
+
+
+

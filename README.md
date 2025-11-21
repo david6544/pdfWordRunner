@@ -2,7 +2,7 @@
 
 ![Example Reader](example.gif)
 
-A simple PDF reader that displays each word in sequence to improve readability and focus.
+A simple PDF reader that displays each word in sequence using Rapid Serial Visual Presentation (RSVP).
 
 **What it does:**
 - **Displays words one-by-one:** The program extracts words from a PDF and shows them in a movable overlay window at a configurable words-per-minute (WPM).

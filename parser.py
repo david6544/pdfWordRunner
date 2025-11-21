@@ -12,7 +12,7 @@ from PIL import Image, ImageTk
 def build_parser():
     parser = argparse.ArgumentParser(
         description=(
-            "A PDF Parser that displays each word in sequence to improve readability"
+            "A PDF Parser that displays each word using RSVP to improve wpm read"
         )
     )
     parser.add_argument("--file", "-f", required=True, help="PDF file to read")

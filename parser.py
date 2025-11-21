@@ -23,8 +23,8 @@ def build_parser():
     parser.add_argument("--resolution", type=int, default=None, help="Render resolution (DPI) for PDF pages; higher gives crisper images")
     parser.add_argument("--no-fit", dest="fit", action="store_false", help="Do not scale pages to fit the window; show at full rendered size with scrollbars")
     parser.add_argument("--cache-size", type=int, default=16, help="Number of rendered pages to keep in memory (LRU)")
-    parser.add_argument("--start-page", type=int, default=0, help="starting page of pdf to process")
-    parser.add_argument("--end-page", type=int, default=-1, help="ending page of pdf to process")
+    parser.add_argument("--start-page", type=int, default=1, help="Starting page of PDF to process (1-indexed)")
+    parser.add_argument("--end-page", type=int, default=-1, help="Ending page of PDF to process (1-indexed). Use -1 for last page")
     
     return parser
 
@@ -101,11 +101,32 @@ def main():
     screen_w = root.winfo_screenwidth()
     screen_h = root.winfo_screenheight()
 
-    # If user provided an explicit resolution, use it; otherwise compute a DPI so page width maps to screen width
+    # Normalize start/end page args (user-facing are 1-indexed)
+    # Convert them to 0-based indices for internal use.
+    raw_start = getattr(args, 'start_page', 1)
+    raw_end = getattr(args, 'end_page', -1)
     try:
-        # Peek at a page's width (prefer start_page if provided) in PDF points to compute appropriate DPI
+        if raw_start is None:
+            raw_start = 1
+        raw_start = int(raw_start)
+    except Exception:
+        raw_start = 1
+    try:
+        raw_end = int(raw_end)
+    except Exception:
+        raw_end = -1
+
+    if raw_start < 1:
+        raw_start = 1
+    start_idx = raw_start - 1
+    # end: -1 means last page; otherwise convert to 0-based
+    end_idx = -1 if raw_end < 1 else (raw_end - 1)
+
+    #compute a DPI so page width maps to screen width or use user provided res
+    try:
+        # Peek at a page's width (prefer start_idx if provided) in PDF points to compute appropriate DPI
         pdf_tmp = pdfplumber.open(args.file)
-        preferred_idx = args.start_page if getattr(args, 'start_page', None) is not None else 0
+        preferred_idx = start_idx if 'start_idx' in locals() and start_idx is not None else 0
         if preferred_idx < 0:
             preferred_idx = 0
         first_page = pdf_tmp.pages[preferred_idx] if pdf_tmp.pages and preferred_idx < len(pdf_tmp.pages) else (pdf_tmp.pages[0] if pdf_tmp.pages else None)
@@ -123,7 +144,7 @@ def main():
         render_dpi = 300
 
     try:
-        words, pdf = load_pdf_index(args.file, args.start_page, args.end_page)
+        words, pdf = load_pdf_index(args.file, start_idx, end_idx)
     except RuntimeError as e:
         print(e, file=sys.stderr)
         sys.exit(1)
@@ -201,6 +222,15 @@ def main():
     h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
     canvas.pack(fill=tk.BOTH, expand=True)
 
+    # Small HUD overlay on the canvas showing WPM and current page
+    hud_frame = tk.Frame(canvas, bg="#000000", bd=0)
+    hud_wpm = tk.Label(hud_frame, text=f"{args.wpm} WPM", fg="white", bg="#000000", font=(None, 11))
+    hud_page = tk.Label(hud_frame, text="Page -", fg="white", bg="#000000", font=(None, 11))
+    hud_wpm.pack(side=tk.LEFT, padx=(6, 8))
+    hud_page.pack(side=tk.LEFT, padx=(0, 6))
+    # place HUD into the canvas (top-left) and keep its item id so we can raise it later
+    hud_window_id = canvas.create_window(10, 10, anchor='nw', window=hud_frame)
+
     # Right: word display as a separate overlay window so it can be moved freely
     overlay = tk.Toplevel(root)
     overlay.title("Reader")
@@ -264,13 +294,12 @@ def main():
         r_top = int(top * current_display_scale) + current_offset_y
         r_bottom = int(bottom * current_display_scale) + current_offset_y
 
-        # remove previous rect then draw new one
-        if current_rect is not None:
-            try:
-                canvas.delete(current_rect)
-            except Exception:
-                pass
-        current_rect = canvas.create_rectangle(r_left, r_top, r_right, r_bottom, outline='red', width=3)
+        # remove previous rect then draw new one (use a tag so HUD isn't deleted)
+        try:
+            canvas.delete("highlight")
+        except Exception:
+            pass
+        current_rect = canvas.create_rectangle(r_left, r_top, r_right, r_bottom, outline='red', width=3, tags=("highlight",))
 
         # Scroll canvas to make the rectangle visible (center it when possible)
         try:
@@ -319,7 +348,15 @@ def main():
                     pages_cache[page_no] = pil
 
         current_page_no = page_no
-        canvas.delete("all")
+        # remove only PDF image and highlight items so HUD (canvas window) remains
+        try:
+            canvas.delete("pdfimg")
+        except Exception:
+            pass
+        try:
+            canvas.delete("highlight")
+        except Exception:
+            pass
         canvas.update_idletasks()
         img_w, img_h = pil.size
         page_meta = pdf.pages[current_page_no]
@@ -349,12 +386,25 @@ def main():
             current_offset_y = 0
             canvas.image = current_photo
         # remove any previous rect when new page is rendered
-        if current_rect is not None:
+        try:
+            canvas.delete("highlight")
+        except Exception:
+            pass
+        current_rect = None
+        # update HUD for current page
+        try:
+            total = len(pdf.pages)
+            if current_page_no is None:
+                hud_page.config(text=f"Page - / {total}")
+            else:
+                hud_page.config(text=f"Page {current_page_no + 1} / {total}")
+            # ensure HUD stays on top of canvas image
             try:
-                canvas.delete(current_rect)
+                canvas.tag_raise(hud_window_id)
             except Exception:
                 pass
-            current_rect = None
+        except Exception:
+            pass
 
 
     def display_next_word():
@@ -385,13 +435,12 @@ def main():
             rtop = int(top * current_display_scale) + current_offset_y
             rbottom = int(bottom * current_display_scale) + current_offset_y
 
-            # remove previous rect then draw new one
-            if current_rect is not None:
-                try:
-                    canvas.delete(current_rect)
-                except Exception:
-                    pass
-            current_rect = canvas.create_rectangle(rx0, rtop, rx1, rbottom, outline='red', width=3)
+            # remove previous rect then draw new one (use a tag so HUD isn't deleted)
+            try:
+                canvas.delete("highlight")
+            except Exception:
+                pass
+            current_rect = canvas.create_rectangle(rx0, rtop, rx1, rbottom, outline='red', width=3, tags=("highlight",))
 
             word_index += 1
             word_id = root.after(delay_ms, display_next_word)
